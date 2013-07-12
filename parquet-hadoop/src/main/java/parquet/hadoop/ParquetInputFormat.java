@@ -153,6 +153,7 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
       Class<?> readSupportClass,
       String requestedSchema,
       Map<String, String> readSupportMetadata) throws IOException {
+    String fileSchema = fileMetaData.getSchema().toString().intern();
     Comparator<BlockLocation> comparator = new Comparator<BlockLocation>() {
       @Override
       public int compare(BlockLocation b1, BlockLocation b2) {
@@ -206,9 +207,8 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
           length,
           hdfsBlock.getHosts(),
           blocksForCurrentSplit,
-          fileMetaData.getSchema().toString(),
           requestedSchema,
-          fileMetaData.getSchema().toString(),
+          fileSchema,
           fileMetaData.getKeyValueMetaData(),
           readSupportMetadata
           ));

@@ -165,7 +165,7 @@ public class ParquetRecordReader<T> extends RecordReader<Void, T> {
     this.recordConverter = readSupport.prepareForRead(
         configuration,
         parquetInputSplit.getExtraMetadata(),
-        MessageTypeParser.parseMessageType(parquetInputSplit.getSchema()),
+        MessageTypeParser.parseMessageType(parquetInputSplit.getFileSchema()),
         new ReadSupport.ReadContext(requestedSchema, parquetInputSplit.getReadSupportMetadata()));
 
     Path path = parquetInputSplit.getPath();

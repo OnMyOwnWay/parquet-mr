@@ -25,15 +25,22 @@ import java.io.ObjectOutputStream;
 import java.io.Serializable;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
 
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.io.Writable;
 import org.apache.hadoop.mapreduce.InputSplit;
 
+import parquet.column.Encoding;
 import parquet.hadoop.metadata.BlockMetaData;
+import parquet.hadoop.metadata.ColumnChunkMetaData;
+import parquet.hadoop.metadata.CompressionCodecName;
+import parquet.schema.PrimitiveType.PrimitiveTypeName;
 
 /**
  * An input split for the Parquet format
@@ -41,15 +48,13 @@ import parquet.hadoop.metadata.BlockMetaData;
  *
  * @author Julien Le Dem
  */
-public class ParquetInputSplit extends InputSplit implements Serializable, Writable {
-  private static final long serialVersionUID = 1L;
+public class ParquetInputSplit extends InputSplit implements Writable {
 
   private String path;
   private long start;
   private long length;
   private String[] hosts;
   private List<BlockMetaData> blocks;
-  private String schema;
   private String requestedSchema;
   private String fileSchema;
   private Map<String, String> extraMetadata;
@@ -82,17 +87,15 @@ public class ParquetInputSplit extends InputSplit implements Serializable, Writa
       long length,
       String[] hosts,
       List<BlockMetaData> blocks,
-      String schema,
       String requestedSchema,
       String fileSchema,
       Map<String, String> extraMetadata,
       Map<String, String> readSupportMetadata) {
-    this.path = path.toUri().toString();
+    this.path = path.toUri().toString().intern();
     this.start = start;
     this.length = length;
     this.hosts = hosts;
     this.blocks = blocks;
-    this.schema = schema;
     this.requestedSchema = requestedSchema;
     this.fileSchema = fileSchema;
     this.extraMetadata = extraMetadata;
@@ -141,13 +144,6 @@ public class ParquetInputSplit extends InputSplit implements Serializable, Writa
   }
 
   /**
-   * @return the schema to read
-   */
-  public String getSchema() {
-    return schema;
-  }
-
-  /**
    * @return the requested schema
    */
   public String getRequestedSchema() {
@@ -184,17 +180,23 @@ public class ParquetInputSplit extends InputSplit implements Serializable, Writa
     byte[] b = new byte[l];
     in.readFully(b);
     try {
-      ParquetInputSplit other = (ParquetInputSplit)new ObjectInputStream(new ByteArrayInputStream(b)).readObject();
-      this.path = other.path;
-      this.start = other.start;
-      this.length = other.length;
-      this.hosts = other.hosts;
-      this.blocks = other.blocks;
-      this.schema = other.schema;
-      this.requestedSchema = other.requestedSchema;
-      this.fileSchema = other.fileSchema;
-      this.extraMetadata = other.extraMetadata;
-      this.readSupportMetadata = other.readSupportMetadata;
+      ObjectInputStream ois = new ObjectInputStream(new ByteArrayInputStream(b));
+      this.path = ois.readUTF().intern();
+      this.start = ois.readLong();
+      this.length = ois.readLong();
+      this.hosts = new String[ois.readInt()];
+      for (int i = 0; i < hosts.length; i++) {
+        hosts[i] = ois.readUTF().intern();
+      }
+      int blocksSize = ois.readInt();
+      this.blocks = new ArrayList<BlockMetaData>(blocksSize);
+      for (int i = 0; i < blocksSize; i++) {
+        blocks.add(readBlock(ois));
+      }
+      this.requestedSchema = ois.readUTF().intern();
+      this.fileSchema = ois.readUTF().intern();
+      this.extraMetadata = readKeyValues(ois);
+      this.readSupportMetadata = readKeyValues(ois);
     } catch (ClassNotFoundException e) {
       throw new IOException("wrong class serialized", e);
     }
@@ -206,10 +208,119 @@ public class ParquetInputSplit extends InputSplit implements Serializable, Writa
   @Override
   public void write(DataOutput out) throws IOException {
     ByteArrayOutputStream baos = new ByteArrayOutputStream();
-    new ObjectOutputStream(baos).writeObject(this);
+    ObjectOutputStream oos = new ObjectOutputStream(baos);
+    oos.writeUTF(path);
+    oos.writeLong(start);
+    oos.writeLong(length);
+    oos.writeInt(hosts.length);
+    for (String host : hosts) {
+      oos.writeUTF(host);
+    }
+    oos.writeInt(blocks.size());
+    for (BlockMetaData block : blocks) {
+      writeBlock(oos, block);
+    }
+    oos.writeUTF(requestedSchema);
+    oos.writeUTF(fileSchema);
+    writeKeyValues(oos, extraMetadata);
+    writeKeyValues(oos, readSupportMetadata);
+    oos.flush();
     byte[] b = baos.toByteArray();
     out.writeInt(b.length);
     out.write(b);
+  }
+
+  private BlockMetaData readBlock(ObjectInputStream ois) throws IOException,
+      ClassNotFoundException {
+    final BlockMetaData block = new BlockMetaData();
+    int size = ois.readInt();
+    for (int i = 0; i < size; i++) {
+      block.addColumn(readColumn(ois));
+    }
+    block.setRowCount(ois.readLong());
+    block.setTotalByteSize(ois.readLong());
+    if (!ois.readBoolean()) {
+      block.setPath(ois.readUTF().intern());
+    }
+    return block;
+  }
+
+  private void writeBlock(ObjectOutputStream oos, BlockMetaData block)
+      throws IOException {
+    oos.writeInt(block.getColumns().size());
+    for (ColumnChunkMetaData column : block.getColumns()) {
+      writeColumn(oos, column);
+    }
+    oos.writeLong(block.getRowCount());
+    oos.writeLong(block.getTotalByteSize());
+    oos.writeBoolean(block.getPath() == null);
+    if (block.getPath() != null) {
+      oos.writeUTF(block.getPath());
+    }
+  }
+
+  private ColumnChunkMetaData readColumn(ObjectInputStream ois)
+      throws IOException, ClassNotFoundException {
+    CompressionCodecName codec = CompressionCodecName.values()[ois.readInt()];
+    String[] columnPath = new String[ois.readInt()];
+    for (int i = 0; i < columnPath.length; i++) {
+      columnPath[i] = ois.readUTF().intern();
+    }
+    PrimitiveTypeName type = PrimitiveTypeName.values()[ois.readInt()];
+    int encodingsSize = ois.readInt();
+    List<Encoding> encodings = new ArrayList<Encoding>(encodingsSize);
+    for (int i = 0; i < encodingsSize; i++) {
+      encodings.add(Encoding.values()[ois.readInt()]);
+    }
+    ColumnChunkMetaData column = new ColumnChunkMetaData(columnPath, type, codec, encodings);
+    column.setFirstDataPageOffset(ois.readLong());
+    column.setDictionaryPageOffset(ois.readLong());
+    column.setValueCount(ois.readLong());
+    column.setTotalSize(ois.readLong());
+    column.setTotalUncompressedSize(ois.readLong());
+    return column;
+  }
+
+  private void writeColumn(ObjectOutputStream oos, ColumnChunkMetaData column)
+      throws IOException {
+    oos.writeInt(column.getCodec().ordinal());
+    oos.writeInt(column.getPath().length);
+    for (String s : column.getPath()) {
+      oos.writeUTF(s);
+    }
+    oos.writeInt(column.getType().ordinal());
+    oos.writeInt(column.getEncodings().size());
+    for (Encoding encoding : column.getEncodings()) {
+      oos.writeInt(encoding.ordinal());
+    }
+    oos.writeLong(column.getFirstDataPageOffset());
+    oos.writeLong(column.getDictionaryPageOffset());
+    oos.writeLong(column.getValueCount());
+    oos.writeLong(column.getTotalSize());
+    oos.writeLong(column.getTotalUncompressedSize());
+  }
+
+  private Map<String, String> readKeyValues(ObjectInputStream ois) throws IOException {
+    int size = ois.readInt();
+    Map<String, String> map = new HashMap<String, String>(size);
+    for (int i = 0; i < size; i++) {
+      String key = ois.readUTF().intern();
+      String value = ois.readUTF().intern();
+      map.put(key, value);
+    }
+    return map;
+  }
+
+  private void writeKeyValues(ObjectOutputStream oos, Map<String, String> map) throws IOException {
+    if (map == null) {
+      oos.writeInt(0);
+    } else {
+      oos.writeInt(map.size());
+      for (Entry<String, String> entry : map.entrySet()) {
+        oos.writeUTF(entry.getKey());
+        oos.writeUTF(entry.getValue());
+      }
+    }
   }
 
   @Override
@@ -220,8 +331,7 @@ public class ParquetInputSplit extends InputSplit implements Serializable, Writa
         + " length: " + length
         + " hosts: " + Arrays.toString(hosts)
         + " blocks: " + blocks.size()
-        + " schema: " + schema
-        + " requestedSchema: " + requestedSchema
+        + " requestedSchema: " + (fileSchema.equals(requestedSchema) ? "same as file" : requestedSchema)
         + " fileSchema: " + fileSchema
         + " extraMetadata: " + extraMetadata
         + " readSupportMetadata: " + readSupportMetadata
